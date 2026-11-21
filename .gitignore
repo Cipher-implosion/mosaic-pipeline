@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+models/
+third_party/
+mosaic_frames_*/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
