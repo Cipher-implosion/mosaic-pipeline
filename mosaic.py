@@ -297,7 +297,15 @@ class LazyFrames:
 # ------------------------------------------------------------------------ detector
 class Detector:
     def __init__(self, weights, class_names, conf):
-        from ultralytics import YOLO
+        from ultralytics import YOLO, settings as _yolo_settings
+        # Disable Ultralytics anonymous usage analytics (Google Analytics)
+        # and Sentry error reporting. They are on by default (settings
+        # sync=True) and send version/OS/usage stats. No video or file data
+        # is involved, but this app is meant to run fully locally, so turn
+        # it off before the model is built (Events reads the setting then).
+        # Gradio analytics are already off in app.py; this is the last one.
+        if _yolo_settings.get("sync", True):
+            _yolo_settings.update({"sync": False})
         self.model = YOLO(weights)
         names = self.model.names
         wanted = [c.strip() for c in class_names.split(",") if c.strip()]
