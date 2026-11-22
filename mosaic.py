@@ -49,6 +49,37 @@ def log(msg):
     print(f"[mosaic] {msg}", file=sys.stderr, flush=True)
 
 
+EMPTY_STREAK_MIN = 10  # consecutive empty masks that trigger an empty_streak event
+
+
+def emit_event(kind, **kv):
+    """Machine-readable alert line on stdout, printed as the event happens:
+    `[mosaic-event] type=<kind> key=value ...` (values never contain spaces).
+    Purely informational: it does not change tracking, the [mosaic] progress
+    lines (stderr) or the stats-json."""
+    parts = [f"type={kind}"]
+    for k, v in kv.items():
+        if isinstance(v, bool):
+            v = int(v)
+        parts.append(f"{k}={str(v).replace(' ', '')}")
+    print("[mosaic-event] " + " ".join(parts), file=sys.stdout, flush=True)
+
+
+def frame_ranges(frames):
+    """[0,1,2,5,7,8] -> '0-2,5,7-8' (sorted, compact)."""
+    out, run = [], None
+    for f in sorted(frames):
+        if run and f == run[1] + 1:
+            run[1] = f
+        else:
+            if run:
+                out.append(run)
+            run = [f, f]
+    if run:
+        out.append(run)
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in out)
+
+
 def fmt_dur(s):
     s = int(round(s))
     h, rem = divmod(s, 3600)
@@ -165,6 +196,13 @@ def build_argparser():
                     help="tracking counts as lost when mask area < this fraction of the recent "
                          "median area (default 0.05)")
     ap.add_argument("--min-area", type=int, default=16, help="mask area (px) below which = lost")
+    ap.add_argument("--hold-frames", type=int, default=0,
+                    help="mask hold: when the mask is empty or < 35%% of the median of the last "
+                         "10 good masks, draw it united with the last good mask for up to N "
+                         "consecutive frames (drawing only; SAM 2 tracking is unaffected; the "
+                         "reference is reset when a hold expires; masks > 2x the median are "
+                         "kept out of the reference unless they persist 5 frames). "
+                         "0 = off (default)")
     ap.add_argument("--max-seconds", type=float, help="only process the first N seconds")
     ap.add_argument("--crf", type=int, default=18, help="x264 CRF of the output (default 18)")
     ap.add_argument("--preset", default="medium", help="x264 preset (default medium)")
@@ -462,8 +500,17 @@ class Tracker:
         a = self.args
         ref = deque(maxlen=15)
         lost_since, last_bbox, last_good, rel, next_try = None, None, None, None, None
-        prog = Progress(f"tracking {'forward' if step > 0 else 'reverse'}",
-                        abs(end - start) + 1)
+        pname = "forward" if step > 0 else "reverse"
+        prog = Progress(f"tracking {pname}", abs(end - start) + 1)
+        # empty-mask streak bookkeeping for [mosaic-event] alerts only
+        es = {"start": None, "last": None, "len": 0}
+
+        def end_streak():
+            if es["len"] >= EMPTY_STREAK_MIN:
+                emit_event("empty_streak", frame=es["start"], length=es["len"], last=es["last"],
+                           state="ended", **{"pass": pname})
+            es.update(start=None, last=None, len=0)
+
         t = start
         while True:
             nxt = stops[0] if stops else None
@@ -482,12 +529,25 @@ class Tracker:
                     self.masks[f] = np.packbits(m)
                     self.areas[f] = area
                     prog.update(abs(f - start) + 1)  # frames of this pass covered so far
+                    if area > 0:
+                        end_streak()
+                    elif f != es["last"]:  # (a frame re-yielded after a re-prompt counts once)
+                        if es["start"] is None:
+                            es["start"] = f
+                        es["last"] = f
+                        es["len"] += 1
+                        if es["len"] == EMPTY_STREAK_MIN:
+                            emit_event("empty_streak", frame=es["start"], length=es["len"],
+                                       last=f, state="ongoing", **{"pass": pname})
                     thr =max(a.min_area, a.lost_frac * (float(np.median(ref)) if ref else area))
                     if area >= thr and area > 0:
                         if lost_since is not None:
                             self.events.append({"frame": f, "event": "tracking_resumed",
                                                 "lost_frames": abs(f - lost_since), "mask_area": area})
                             log(f"tracking resumed @{f} after {abs(f - lost_since)} lost frames")
+                            emit_event("resumed", frame=f, lost_since=lost_since,
+                                       lost_frames=abs(f - lost_since), area=area,
+                                       **{"pass": pname})
                         lost_since, rel = None, None
                         ref.append(area)
                         last_bbox = mask_bbox(m)
@@ -499,6 +559,7 @@ class Tracker:
                         self.events.append({"frame": f, "event": "lost", "mask_area": area,
                                             "ref_area": float(np.median(ref)) if ref else None})
                         log(f"tracking lost @{f} (area {area}px)")
+                        emit_event("lost", frame=f, area=area, **{"pass": pname})
                         if self.det is not None and last_bbox is not None:
                             rel = self.relative_geometry(last_good, last_bbox)
                         next_try = f
@@ -519,10 +580,14 @@ class Tracker:
                 if area < a.min_area:
                     # SAM rejected the proposal: keep scanning a bit later
                     next_try = f + step * max(a.detect_every, 5)
+                    emit_event("reacquire_failed", frame=f, area=area, **{"pass": pname})
+                else:
+                    emit_event("reacquired", frame=f, area=area, **{"pass": pname})
                 t = f
                 continue
             if nxt is None:
                 prog.finish()
+                end_streak()
                 break
             stops.pop(0)
             self.add_prompt(nxt, prompts[nxt])
@@ -543,6 +608,95 @@ class Tracker:
         if p is None:
             return None
         return np.unpackbits(p, count=self.w * self.h).reshape(self.h, self.w).astype(bool)
+
+
+# ---------------------------------------------------------------------- mask hold
+HOLD_REF_N = 10      # good-mask areas kept for the reference median
+HOLD_BAD_FRAC = 0.35  # mask is "bad" when area < this fraction of that median
+HOLD_SPIKE_FRAC = 2.0  # area > this x the median = "spike": drawn as-is, kept out of the reference
+HOLD_SPIKE_ACCEPT = 5  # this many consecutive spikes = real size change: areas enter the reference
+
+
+def compute_hold(areas, n, frame0, hold_frames, trace=None):
+    """Decide, per frame, which tracked mask to *draw* (SAM 2 state is untouched).
+
+    Walks the frames in tracking order (forward from frame0, then reverse from
+    frame0 if frame0 > 0). A frame is bad when its mask is empty or its area is
+    below HOLD_BAD_FRAC x the median of the last HOLD_REF_N good areas. During a
+    run of bad frames the drawn mask is the UNION of the frame's own mask and the
+    last good mask (the own mask is never discarded, so coverage can never drop
+    below no-hold), for at most `hold_frames` frames of the run; later frames of
+    the same run draw only their own (bad/empty) mask. When a run expires (more
+    than `hold_frames` consecutive bad frames) the reference history of good
+    areas is cleared, so an inflated median cannot keep flagging normal masks.
+    The first good frame ends the run and resets the counter.
+
+    Spike guard (BRIEF-HOLD3): a frame whose area is > HOLD_SPIKE_FRAC x the
+    reference median (typically an occluder absorbed into the mask) is NOT bad
+    -- it draws its own mask and ends any bad run -- but its area is kept out
+    of the reference and it does not become the "last good" mask, so it cannot
+    inflate the median and flag the normal masks that follow. From the
+    HOLD_SPIKE_ACCEPT-th consecutive spike on, the size change is taken as real:
+    each such frame's (latest) area enters the reference and it counts as good,
+    so the median catches up within a few frames.
+
+    Returns (source, runs): source[f] = last good frame whose mask is OR-ed into
+    the drawn mask at f (f itself when not held, i.e. draw own mask only);
+    runs = list of hold runs {start, end, source, held, expired}.
+    trace: optional dict filled with f -> "good" | "spike" | "spike_accept" |
+    "bad_held" | "bad" (diagnostics / tests only)."""
+    source = {f: f for f in range(n)}
+    runs = []
+    if hold_frames <= 0:
+        return source, runs
+    orders = [range(frame0, n)]
+    if frame0 > 0:
+        orders.append(range(frame0, -1, -1))
+    for oi, order in enumerate(orders):
+        ref = deque(maxlen=HOLD_REF_N)
+        last_good, bad_run, run, spike_run = None, 0, None, 0
+        for f in order:
+            area = areas.get(f, 0)
+            med = float(np.median(ref)) if ref else None
+            good = area > 0 and (med is None or area >= HOLD_BAD_FRAC * med)
+            if good and med is not None and area > HOLD_SPIKE_FRAC * med:
+                spike_run += 1
+                bad_run, run = 0, None
+                if spike_run < HOLD_SPIKE_ACCEPT:
+                    if trace is not None and not (oi and f == frame0):
+                        trace[f] = "spike"
+                    continue  # own mask, not held, not added to the reference
+                ref.append(area)  # persistent: accept as a real size change
+                last_good = f
+                if trace is not None and not (oi and f == frame0):
+                    trace[f] = "spike_accept"
+                continue
+            if good:
+                ref.append(area)
+                last_good, bad_run, run, spike_run = f, 0, None, 0
+                if trace is not None and not (oi and f == frame0):
+                    trace[f] = "good"
+                continue
+            spike_run = 0
+            bad_run += 1
+            if trace is not None and not (oi and f == frame0):
+                trace[f] = "bad_held" if (last_good is not None and bad_run <= hold_frames) else "bad"
+            if last_good is None:
+                continue
+            if run is None:
+                run = {"start": f, "end": f, "source": last_good, "held": [], "expired": False}
+                runs.append(run)
+            run["end"] = f
+            if bad_run <= hold_frames:
+                if f != frame0:  # frame0 is owned by the forward pass
+                    source[f] = last_good
+                    run["held"].append(f)
+            else:
+                if not run["expired"]:
+                    ref.clear()  # expired: drop the (possibly inflated) reference
+                run["expired"] = True
+    runs = [r for r in runs if r["held"] or r["expired"]]
+    return source, runs
 
 
 # -------------------------------------------------------------------------- mosaic
@@ -572,7 +726,8 @@ def pixelate_masked(img, mask, block, kernel):
     return out
 
 
-def render(args, tracker, info, n, w, h):
+def render(args, tracker, info, n, w, h, source=None):
+    """source: optional frame -> frame whose tracked mask is drawn (mask hold)."""
     kernel = None
     if args.dilate > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * args.dilate + 1,) * 2)
@@ -590,7 +745,7 @@ def render(args, tracker, info, n, w, h):
                 *ffmpeg_trim_args(args.max_seconds), args.output]
     enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
     fsize = w * h * 3
-    i, masked = 0, 0
+    i, masked, unmasked = 0, 0, []
     t0 = time.perf_counter()
     prog = Progress("rendering", n)
     try:
@@ -600,9 +755,15 @@ def render(args, tracker, info, n, w, h):
                 break
             img = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
             m = tracker.mask(i)
+            if source is not None and source.get(i, i) != i:  # hold: own mask U last good
+                held = tracker.mask(source[i])
+                if held is not None:
+                    m = held if m is None else (m | held)
             if m is not None and m.any():
                 masked += 1
                 img = pixelate_masked(img, m, args.block, kernel)
+            else:
+                unmasked.append(i)
             enc.stdin.write(img.tobytes())
             i += 1
             prog.update(i)
@@ -616,7 +777,8 @@ def render(args, tracker, info, n, w, h):
         raise SystemExit("ffmpeg encode failed")
     if i != n:
         log(f"WARNING: decoded {i} frames for rendering but {n} were tracked")
-    return {"frames_written": i, "frames_masked": masked, "seconds": time.perf_counter() - t0}
+    return {"frames_written": i, "frames_masked": masked, "seconds": time.perf_counter() - t0,
+            "unmasked": unmasked}
 
 
 # ---------------------------------------------------------------------------- main
@@ -639,6 +801,8 @@ def main(argv=None):
         raise SystemExit("give at least one --point or a --box for --frame")
     if args.block < 2:
         raise SystemExit("--block must be >= 2")
+    if args.hold_frames < 0:
+        raise SystemExit("--hold-frames must be >= 0")
     import torch
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but torch.cuda.is_available() is False")
@@ -681,16 +845,38 @@ def main(argv=None):
         log(f"tracking done: {tracker.sam_frames} SAM frame steps in {t_track:.1f}s "
             f"({1000 * t_track / max(n, 1):.0f} ms/frame)")
 
-        r = render(args, tracker, info, n, w, h)
+        source, hold_runs = compute_hold(tracker.areas, n, args.frame, args.hold_frames)
+        hold_list = sorted(f for f in range(n) if source[f] != f)
+        if args.hold_frames > 0:
+            for hr in hold_runs:
+                tracker.events.append({"frame": hr["start"], "event": "hold",
+                                       "held_frames": hr["held"], "source_frame": hr["source"],
+                                       "bad_until": hr["end"], "expired": hr["expired"]})
+                if hr["held"]:
+                    emit_event("hold", frame=hr["start"], held=len(hr["held"]),
+                               held_frames=frame_ranges(hr["held"]), source=hr["source"],
+                               end=hr["end"], expired=hr["expired"])
+            log(f"mask hold (N={args.hold_frames}): {len(hold_list)} frame(s) held in "
+                f"{len(hold_runs)} run(s)" + (f": {hold_list}" if hold_list else ""))
+        r = render(args, tracker, info, n, w, h, source if args.hold_frames > 0 else None)
         log(f"rendered {r['frames_written']} frames ({r['frames_masked']} with mask) "
             f"in {r['seconds']:.1f}s -> {args.output}")
+        emit_event("unmasked", count=len(r["unmasked"]), frames=r["frames_written"],
+                   ranges=frame_ranges(r["unmasked"]) or "-")
 
         if args.save_masks:
             np.savez_compressed(
                 args.save_masks, shape=np.array([h, w]),
                 masks=np.stack([tracker.masks.get(i, np.zeros((h * w + 7) // 8, np.uint8))
                                 for i in range(n)]),
-                tracked=np.array([i in tracker.masks for i in range(n)]))
+                tracked=np.array([i in tracker.masks for i in range(n)]),
+                **({"render_masks": np.stack([
+                    np.bitwise_or(tracker.masks.get(i, np.zeros((h * w + 7) // 8, np.uint8)),
+                                  tracker.masks.get(source[i], np.zeros((h * w + 7) // 8, np.uint8)))
+                    for i in range(n)]),
+                    "held": np.array([source[i] != i for i in range(n)]),
+                    "hold_source": np.array([source[i] for i in range(n)])}
+                   if args.hold_frames > 0 else {}))
         total = time.perf_counter() - t_start
         stats = {
             "input": args.input, "output": args.output, "frames": n, "size": [w, h],
@@ -709,6 +895,10 @@ def main(argv=None):
             "peak_rss_mb": peak_rss_mb(),
             "events": tracker.events,
         }
+        if args.hold_frames > 0:
+            stats["hold"] = {"hold_frames_max": args.hold_frames, "ref_n": HOLD_REF_N,
+                             "bad_frac": HOLD_BAD_FRAC, "runs": hold_runs}
+            stats["hold_frames"] = hold_list
         log(f"total {total:.1f}s; events: " +
             ", ".join(f"{e['event']}@{e['frame']}" for e in tracker.events))
         if args.stats_json:
